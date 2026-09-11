@@ -198,3 +198,24 @@ class OrganizationMemberDetailResponse(BaseModel):
     joined_at: Optional[str] = None
     left_at: Optional[str] = None
     notes: Optional[str] = None
+
+
+class OrganizationMemberBatchCreate(BaseModel):
+    """批量添加组织成员"""
+    members: List[OrganizationMemberCreate] = Field(..., min_length=1, description="成员列表")
+
+
+class OrganizationMemberBatchItemResult(BaseModel):
+    """批量添加中的单条结果"""
+    character_id: Optional[str] = None
+    character_name: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class OrganizationMemberBatchResponse(BaseModel):
+    """批量添加组织成员的响应"""
+    added: List[OrganizationMemberResponse]
+    skipped: List[OrganizationMemberBatchItemResult]
+    errors: List[OrganizationMemberBatchItemResult]
+    warnings: List[str] = []
+    member_count: int

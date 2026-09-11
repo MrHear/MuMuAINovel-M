@@ -20,7 +20,13 @@ from app.schemas.relationship import (
     OrganizationMemberCreate,
     OrganizationMemberUpdate,
     OrganizationMemberResponse,
-    OrganizationMemberDetailResponse
+    OrganizationMemberDetailResponse,
+    OrganizationMemberBatchCreate,
+    OrganizationMemberBatchResponse,
+)
+from app.services.organization_member_service import (
+    add_organization_members_batch,
+    sync_organization_member_count,
 )
 from app.schemas.character import CharacterResponse
 from app.services.ai_service import AIService
@@ -306,6 +312,8 @@ async def add_organization_member(
     char = char_result.scalar_one_or_none()
     if not char:
         raise HTTPException(status_code=404, detail="角色不存在")
+    if char.project_id != org.project_id:
+        raise HTTPException(status_code=400, detail="角色不属于该组织所在项目")
     if char.is_organization:
         raise HTTPException(status_code=400, detail="不能将组织添加为成员")
     
@@ -328,15 +336,58 @@ async def add_organization_member(
         source="manual"
     )
     db.add(db_member)
-    
-    # 更新组织成员计数
-    org.member_count += 1
+    await db.flush()
+    await sync_organization_member_count(org, db)
     
     await db.commit()
     await db.refresh(db_member)
     
     logger.info(f"添加成员成功：{char.name} 加入组织 {org_id}")
     return db_member
+
+
+@router.post(
+    "/{org_id}/members/batch",
+    response_model=OrganizationMemberBatchResponse,
+    summary="批量添加组织成员",
+)
+async def add_organization_members_batch_api(
+    org_id: str,
+    payload: OrganizationMemberBatchCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+):
+    """一次添加多名成员。已存在的角色会跳过，单条失败不影响其他成员。"""
+    org_result = await db.execute(
+        select(Organization).where(Organization.id == org_id)
+    )
+    org = org_result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="组织不存在")
+
+    user_id = getattr(request.state, 'user_id', None)
+    await verify_project_access(org.project_id, user_id, db)
+
+    result = await add_organization_members_batch(
+        db,
+        org,
+        [member.model_dump() for member in payload.members],
+    )
+    await db.commit()
+    for member in result.added:
+        await db.refresh(member)
+
+    logger.info(
+        f"批量添加成员：组织 {org_id} 成功 {len(result.added)}，"
+        f"跳过 {len(result.skipped)}，失败 {len(result.errors)}"
+    )
+    return OrganizationMemberBatchResponse(
+        added=result.added,
+        skipped=result.skipped,
+        errors=result.errors,
+        warnings=result.warnings,
+        member_count=result.member_count,
+    )
 
 
 @router.put("/members/{member_id}", response_model=OrganizationMemberResponse, summary="更新成员信息")
@@ -403,9 +454,10 @@ async def remove_organization_member(
     # 验证用户权限
     user_id = getattr(request.state, 'user_id', None)
     await verify_project_access(org.project_id, user_id, db)
-    org.member_count = max(0, org.member_count - 1)
-    
+
     await db.delete(db_member)
+    await db.flush()
+    await sync_organization_member_count(org, db)
     await db.commit()
     
     logger.info(f"移除成员成功：{member_id}")

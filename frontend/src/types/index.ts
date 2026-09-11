@@ -426,6 +426,42 @@ export interface Character {
   updated_at: string;
 }
 
+export interface OrganizationMemberCreate {
+  character_id: string;
+  position: string;
+  rank?: number;
+  status?: string;
+  joined_at?: string;
+  left_at?: string;
+  loyalty?: number;
+  contribution?: number;
+  notes?: string;
+}
+
+export interface OrganizationMemberBatchItemResult {
+  character_id?: string;
+  character_name?: string;
+  reason?: string;
+}
+
+export interface OrganizationMemberBatchResponse {
+  added: Array<{
+    id: string;
+    organization_id: string;
+    character_id: string;
+    position: string;
+    rank: number;
+    loyalty: number;
+    contribution: number;
+    status: string;
+    source: string;
+  }>;
+  skipped: OrganizationMemberBatchItemResult[];
+  errors: OrganizationMemberBatchItemResult[];
+  warnings: string[];
+  member_count: number;
+}
+
 export interface CharacterUpdate {
   name?: string;
   age?: string;

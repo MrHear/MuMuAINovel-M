@@ -1,7 +1,7 @@
 """导入导出服务"""
 import json
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from app.models.project import Project
@@ -34,6 +34,21 @@ from app.schemas.import_export import (
     ImportResult
 )
 from app.logger import get_logger
+from app.services.organization_member_service import (
+    build_portable_member_payload,
+    load_character_name_map,
+    load_project_character_index,
+    restore_organization_members,
+    sync_organization_member_count,
+)
+from app.services.portable_link_service import (
+    build_career_name_mapping,
+    build_character_name_mapping,
+    collect_legacy_career_links,
+    restore_character_careers,
+    restore_relationships,
+    upsert_careers_from_pack,
+)
 
 logger = get_logger(__name__)
 
@@ -41,8 +56,10 @@ logger = get_logger(__name__)
 class ImportExportService:
     """导入导出服务类"""
     
-    SUPPORTED_VERSIONS = ["1.0.0", "1.1.0"]  # 支持的版本列表
-    CURRENT_VERSION = "1.1.0"  # 当前导出版本
+    SUPPORTED_VERSIONS = ["1.0.0", "1.1.0"]  # 完整项目导入支持的版本
+    CURRENT_VERSION = "1.1.0"  # 完整项目导出版本
+    CHARACTER_PACK_VERSION = "1.2.0"
+    SUPPORTED_CHARACTER_PACK_VERSIONS = ["1.0.0", "1.1.0", "1.2.0"]
     
     @staticmethod
     async def export_project(
@@ -294,18 +311,17 @@ class ImportExportService:
         )
         relationships = result.all()
         
+        name_map = await load_character_name_map(
+            db,
+            [rel.character_to_id for rel, _char_from in relationships],
+        )
         exported = []
         for rel, char_from in relationships:
-            # 获取目标角色名称
-            target_result = await db.execute(
-                select(Character).where(Character.id == rel.character_to_id)
-            )
-            char_to = target_result.scalar_one_or_none()
-            
-            if char_to:
+            target_name = name_map.get(rel.character_to_id)
+            if target_name:
                 exported.append(RelationshipExportData(
                     source_name=char_from.name,
-                    target_name=char_to.name,
+                    target_name=target_name,
                     relationship_name=rel.relationship_name,
                     intimacy_level=rel.intimacy_level or 50,
                     status=rel.status or "active",
@@ -362,18 +378,18 @@ class ImportExportService:
         )
         members = result.all()
         
+        name_map = await load_character_name_map(
+            db,
+            [member.character_id for member, _org, _org_char in members],
+        )
+
         exported = []
         for member, org, org_char in members:
-            # 获取成员角色名称
-            char_result = await db.execute(
-                select(Character).where(Character.id == member.character_id)
-            )
-            member_char = char_result.scalar_one_or_none()
-            
-            if member_char:
+            member_name = name_map.get(member.character_id)
+            if member_name:
                 exported.append(OrganizationMemberExportData(
                     organization_name=org_char.name,
-                    character_name=member_char.name,
+                    character_name=member_name,
                     position=member.position,
                     rank=member.rank or 0,
                     status=member.status or "active",
@@ -770,7 +786,7 @@ class ImportExportService:
             
             # 导入关系
             relationships_count = await ImportExportService._import_relationships(
-                new_project.id, data.get("relationships", []), char_mapping, db
+                new_project.id, data.get("relationships", []), char_mapping, db, warnings=warnings
             )
             statistics["relationships"] = relationships_count
             logger.info(f"导入关系数: {relationships_count}")
@@ -784,7 +800,12 @@ class ImportExportService:
             
             # 导入组织成员
             org_members_count = await ImportExportService._import_organization_members(
-                data.get("organization_members", []), char_mapping, org_mapping, db
+                data.get("organization_members", []),
+                char_mapping,
+                org_mapping,
+                db,
+                project_id=new_project.id,
+                warnings=warnings,
             )
             statistics["organization_members"] = org_members_count
             logger.info(f"导入组织成员数: {org_members_count}")
@@ -967,33 +988,21 @@ class ImportExportService:
         project_id: str,
         relationships_data: List[Dict],
         char_mapping: Dict[str, str],
-        db: AsyncSession
+        db: AsyncSession,
+        warnings: Optional[List[str]] = None,
     ) -> int:
-        """导入关系"""
-        count = 0
-        for rel_data in relationships_data:
-            source_name = rel_data.get("source_name")
-            target_name = rel_data.get("target_name")
-            
-            # 查找角色ID
-            source_id = char_mapping.get(source_name)
-            target_id = char_mapping.get(target_name)
-            
-            if source_id and target_id:
-                relationship = CharacterRelationship(
-                    project_id=project_id,
-                    character_from_id=source_id,
-                    character_to_id=target_id,
-                    relationship_name=rel_data.get("relationship_name"),
-                    intimacy_level=rel_data.get("intimacy_level", 50),
-                    status=rel_data.get("status", "active"),
-                    description=rel_data.get("description"),
-                    started_at=rel_data.get("started_at")
-                )
-                db.add(relationship)
-                count += 1
-        
-        return count
+        """导入关系，按 source_name + target_name 在目标项目重建。"""
+        warning_list = warnings if warnings is not None else []
+        name_map = dict(char_mapping)
+        name_map.update(await build_character_name_mapping(db, project_id))
+        stats = await restore_relationships(
+            db,
+            project_id,
+            relationships_data or [],
+            character_name_map=name_map,
+            warnings=warning_list,
+        )
+        return stats.imported
     
     @staticmethod
     async def _import_organizations(
@@ -1050,32 +1059,54 @@ class ImportExportService:
         org_members_data: List[Dict],
         char_mapping: Dict[str, str],
         org_mapping: Dict[str, str],
-        db: AsyncSession
+        db: AsyncSession,
+        project_id: Optional[str] = None,
+        warnings: Optional[List[str]] = None,
     ) -> int:
-        """导入组织成员"""
-        count = 0
+        """导入组织成员，统一按 organization_name + character_name 解析。"""
+        warning_list = warnings if warnings is not None else []
+        if not org_members_data:
+            return 0
+
+        name_to_id, project_character_ids, organization_character_ids = (
+            await load_project_character_index(db, project_id)
+            if project_id
+            else (dict(char_mapping), set(char_mapping.values()), set())
+        )
+        name_to_id.update({name: cid for name, cid in char_mapping.items() if name and cid})
+
+        grouped: Dict[str, List[Dict]] = {}
         for member_data in org_members_data:
             org_name = member_data.get("organization_name")
-            char_name = member_data.get("character_name")
-            
+            if not org_name:
+                warning_list.append("完整项目导入中存在缺少 organization_name 的成员记录，已跳过")
+                continue
+            grouped.setdefault(org_name, []).append(member_data)
+
+        count = 0
+        for org_name, items in grouped.items():
             org_id = org_mapping.get(org_name)
-            char_id = char_mapping.get(char_name)
-            
-            if org_id and char_id:
-                member = OrganizationMember(
-                    organization_id=org_id,
-                    character_id=char_id,
-                    position=member_data.get("position"),
-                    rank=member_data.get("rank", 0),
-                    status=member_data.get("status", "active"),
-                    joined_at=member_data.get("joined_at"),
-                    loyalty=member_data.get("loyalty", 50),
-                    contribution=member_data.get("contribution", 0),
-                    notes=member_data.get("notes")
-                )
-                db.add(member)
-                count += 1
-        
+            if not org_id:
+                warning_list.append(f"未找到组织「{org_name}」，其成员关系未导入")
+                continue
+            org_result = await db.execute(select(Organization).where(Organization.id == org_id))
+            organization = org_result.scalar_one_or_none()
+            if not organization:
+                warning_list.append(f"未找到组织「{org_name}」的详情记录，其成员关系未导入")
+                continue
+            count += await restore_organization_members(
+                db,
+                organization,
+                items,
+                project_id=organization.project_id,
+                warnings=warning_list,
+                org_label=org_name,
+                name_to_id=name_to_id,
+                project_character_ids=project_character_ids,
+                organization_character_ids=organization_character_ids,
+            )
+            await sync_organization_member_count(organization, db)
+
         return count
     
     @staticmethod
@@ -1443,49 +1474,185 @@ class ImportExportService:
                 "created_at": char.created_at.isoformat() if char.created_at else None
             }
             
-            # 如果是组织，添加组织专属字段
-            if char.is_organization:
-                org_result = await db.execute(
-                    select(Organization).where(Organization.character_id == char.id)
-                )
-                org = org_result.scalar_one_or_none()
-                
-                if org:
-                    char_data.update({
-                        "power_level": org.power_level,
-                        "location": org.location,
-                        "motto": org.motto,
-                        "color": org.color
-                    })
-                    
-                    # 从 OrganizationMember 表导出结构化成员数据
-                    members_result = await db.execute(
-                        select(OrganizationMember).where(OrganizationMember.organization_id == org.id)
-                    )
-                    members = members_result.scalars().all()
-                    if members:
-                        char_data["organization_members_data"] = [
-                            {
-                                "character_id": m.character_id,
-                                "position": m.position,
-                                "rank": m.rank,
-                                "loyalty": m.loyalty,
-                                "contribution": m.contribution,
-                                "status": m.status,
-                                "joined_at": m.joined_at,
-                                "source": m.source
-                            }
-                            for m in members
-                        ]
-            
             exported_characters.append(char_data)
+
+        org_chars = [char for char in characters if char.is_organization]
+        if org_chars:
+            org_result = await db.execute(
+                select(Organization).where(
+                    Organization.character_id.in_([char.id for char in org_chars])
+                )
+            )
+            orgs = org_result.scalars().all()
+            org_by_character_id = {org.character_id: org for org in orgs}
+            members_result = await db.execute(
+                select(OrganizationMember).where(
+                    OrganizationMember.organization_id.in_([org.id for org in orgs] or [""])
+                )
+            ) if orgs else None
+            members_by_org: Dict[str, List[OrganizationMember]] = {}
+            all_member_ids: List[str] = []
+            if members_result is not None:
+                for member in members_result.scalars().all():
+                    members_by_org.setdefault(member.organization_id, []).append(member)
+                    all_member_ids.append(member.character_id)
+            name_map = await load_character_name_map(db, all_member_ids)
+
+            for char_data, char in zip(exported_characters, characters):
+                if not char.is_organization:
+                    continue
+                org = org_by_character_id.get(char.id)
+                if not org:
+                    continue
+                char_data.update({
+                    "power_level": org.power_level,
+                    "location": org.location,
+                    "motto": org.motto,
+                    "color": org.color,
+                })
+                portable_members = []
+                for member in members_by_org.get(org.id, []):
+                    member_name = name_map.get(member.character_id)
+                    if not member_name:
+                        continue
+                    portable_members.append(build_portable_member_payload(member, member_name))
+                if portable_members:
+                    char_data["organization_members_data"] = portable_members
+
+        char_ids = [char.id for char in characters]
+        project_ids = {char.project_id for char in characters}
+        relationships_payload: List[Dict[str, Any]] = []
+        careers_payload: List[Dict[str, Any]] = []
+        character_careers_payload: List[Dict[str, Any]] = []
+        if char_ids:
+            rel_result = await db.execute(
+                select(CharacterRelationship).where(
+                    CharacterRelationship.project_id.in_(project_ids),
+                    or_(
+                        CharacterRelationship.character_from_id.in_(char_ids),
+                        CharacterRelationship.character_to_id.in_(char_ids),
+                    ),
+                )
+            )
+            relationships = rel_result.scalars().all()
+            rel_name_map = await load_character_name_map(
+                db,
+                [rel.character_from_id for rel in relationships]
+                + [rel.character_to_id for rel in relationships],
+            )
+            for rel in relationships:
+                source_name = rel_name_map.get(rel.character_from_id)
+                target_name = rel_name_map.get(rel.character_to_id)
+                if not source_name or not target_name:
+                    continue
+                relationships_payload.append({
+                    "source_name": source_name,
+                    "target_name": target_name,
+                    "relationship_name": rel.relationship_name,
+                    "intimacy_level": rel.intimacy_level or 50,
+                    "status": rel.status or "active",
+                    "description": rel.description,
+                    "started_at": rel.started_at,
+                })
+
+            cc_result = await db.execute(
+                select(CharacterCareer, Character, Career)
+                .join(Character, CharacterCareer.character_id == Character.id)
+                .join(Career, CharacterCareer.career_id == Career.id)
+                .where(CharacterCareer.character_id.in_(char_ids))
+            )
+            used_careers: Dict[str, Career] = {}
+            for link, char, career in cc_result.all():
+                character_careers_payload.append({
+                    "character_name": char.name,
+                    "career_name": career.name,
+                    "career_type": link.career_type,
+                    "current_stage": link.current_stage or 1,
+                    "stage_progress": link.stage_progress or 0,
+                    "started_at": link.started_at,
+                    "reached_current_stage_at": link.reached_current_stage_at,
+                    "notes": link.notes,
+                })
+                used_careers[career.id] = career
+
+            extra_career_ids: Set[str] = set()
+            extra_refs: List[Tuple[Character, str, str, int]] = []
+            for char in characters:
+                if char.is_organization:
+                    continue
+                if char.main_career_id:
+                    extra_career_ids.add(char.main_career_id)
+                    extra_refs.append((char, char.main_career_id, "main", char.main_career_stage or 1))
+                raw_subs = char.sub_careers
+                if not raw_subs:
+                    continue
+                try:
+                    subs = json.loads(raw_subs) if isinstance(raw_subs, str) else raw_subs
+                except Exception:
+                    continue
+                if not isinstance(subs, list):
+                    continue
+                for sub in subs[:2]:
+                    if not isinstance(sub, dict) or not sub.get("career_id"):
+                        continue
+                    extra_career_ids.add(sub["career_id"])
+                    extra_refs.append((char, sub["career_id"], "sub", sub.get("stage") or 1))
+
+            missing_career_ids = [cid for cid in extra_career_ids if cid not in used_careers]
+            if missing_career_ids:
+                extra_result = await db.execute(
+                    select(Career).where(
+                        Career.project_id.in_(project_ids),
+                        Career.id.in_(missing_career_ids),
+                    )
+                )
+                for career in extra_result.scalars().all():
+                    used_careers[career.id] = career
+
+            covered_links = {
+                (item["character_name"], item["career_name"], item.get("career_type") or "main")
+                for item in character_careers_payload
+            }
+            for char, career_id, career_type, stage in extra_refs:
+                career = used_careers.get(career_id)
+                if not career:
+                    continue
+                key = (char.name, career.name, career_type)
+                if key in covered_links:
+                    continue
+                character_careers_payload.append({
+                    "character_name": char.name,
+                    "career_name": career.name,
+                    "career_type": career_type,
+                    "current_stage": stage,
+                    "stage_progress": 0,
+                })
+                covered_links.add(key)
+
+            for career in used_careers.values():
+                careers_payload.append({
+                    "name": career.name,
+                    "type": career.type,
+                    "description": career.description,
+                    "category": career.category,
+                    "stages": career.stages,
+                    "max_stage": career.max_stage or 10,
+                    "requirements": career.requirements,
+                    "special_abilities": career.special_abilities,
+                    "worldview_rules": career.worldview_rules,
+                    "attribute_bonuses": career.attribute_bonuses,
+                    "source": "imported",
+                })
         
         export_data = {
-            "version": ImportExportService.CURRENT_VERSION,
+            "version": ImportExportService.CHARACTER_PACK_VERSION,
             "export_time": datetime.utcnow().isoformat(),
             "export_type": "characters",
             "count": len(exported_characters),
-            "data": exported_characters
+            "data": exported_characters,
+            "relationships": relationships_payload,
+            "careers": careers_payload,
+            "character_careers": character_careers_payload,
         }
         
         logger.info(f"角色/组织导出完成: {len(exported_characters)} 个")
@@ -1510,8 +1677,6 @@ class ImportExportService:
         Returns:
             Dict: 导入结果
         """
-        from app.models.career import CharacterCareer, Career
-        
         warnings = []
         imported_characters = []
         imported_organizations = []
@@ -1539,6 +1704,13 @@ class ImportExportService:
                 raise ValueError("项目不存在或无权访问")
             
             logger.info(f"开始导入 {len(characters_data)} 个角色/组织到项目 {project_id}")
+            career_map = await upsert_careers_from_pack(
+                db,
+                project_id,
+                data.get("careers") or [],
+                warnings,
+            )
+            pending_org_members: List[Tuple[Organization, List[Dict[str, Any]], str]] = []
             
             # 处理每个角色/组织
             for idx, char_data in enumerate(characters_data):
@@ -1584,91 +1756,12 @@ class ImportExportService:
                         organization_type=char_data.get("organization_type"),
                         organization_purpose=char_data.get("organization_purpose"),
                         avatar_url=char_data.get("avatar_url"),
-                        main_career_id=None,  # 职业ID需要验证后再设置
-                        main_career_stage=char_data.get("main_career_stage"),
-                        sub_careers=None  # 副职业需要验证后再设置
+                        main_career_id=None,
+                        main_career_stage=None,
+                        sub_careers=None
                     )
                     db.add(character)
                     await db.flush()  # 获取character.id
-                    
-                    # 处理主职业（如果有）
-                    main_career_id = char_data.get("main_career_id")
-                    main_career_stage = char_data.get("main_career_stage")
-                    
-                    if main_career_id and not is_organization:
-                        # 验证职业是否存在
-                        career_result = await db.execute(
-                            select(Career).where(
-                                Career.id == main_career_id,
-                                Career.project_id == project_id,
-                                Career.type == 'main'
-                            )
-                        )
-                        career = career_result.scalar_one_or_none()
-                        
-                        if career:
-                            character.main_career_id = main_career_id
-                            character.main_career_stage = main_career_stage or 1
-                            
-                            # 创建职业关联
-                            char_career = CharacterCareer(
-                                character_id=character.id,
-                                career_id=main_career_id,
-                                career_type='main',
-                                current_stage=main_career_stage or 1,
-                                stage_progress=0
-                            )
-                            db.add(char_career)
-                        else:
-                            warnings.append(f"角色'{name}'的主职业ID不存在，已忽略职业信息")
-                    
-                    # 处理副职业（如果有）
-                    sub_careers = char_data.get("sub_careers")
-                    if sub_careers and not is_organization:
-                        try:
-                            sub_careers_data = json.loads(sub_careers) if isinstance(sub_careers, str) else sub_careers
-                            
-                            if isinstance(sub_careers_data, list):
-                                valid_sub_careers = []
-                                
-                                for sub_data in sub_careers_data[:2]:  # 最多2个副职业
-                                    if isinstance(sub_data, dict):
-                                        career_id = sub_data.get('career_id')
-                                        stage = sub_data.get('stage', 1)
-                                        
-                                        if career_id:
-                                            # 验证副职业是否存在
-                                            career_result = await db.execute(
-                                                select(Career).where(
-                                                    Career.id == career_id,
-                                                    Career.project_id == project_id,
-                                                    Career.type == 'sub'
-                                                )
-                                            )
-                                            career = career_result.scalar_one_or_none()
-                                            
-                                            if career:
-                                                valid_sub_careers.append({
-                                                    'career_id': career_id,
-                                                    'stage': stage
-                                                })
-                                                
-                                                # 创建副职业关联
-                                                char_career = CharacterCareer(
-                                                    character_id=character.id,
-                                                    career_id=career_id,
-                                                    career_type='sub',
-                                                    current_stage=stage,
-                                                    stage_progress=0
-                                                )
-                                                db.add(char_career)
-                                
-                                if valid_sub_careers:
-                                    character.sub_careers = json.dumps(valid_sub_careers, ensure_ascii=False)
-                                elif sub_careers_data:
-                                    warnings.append(f"角色'{name}'的副职业ID不存在，已忽略副职业信息")
-                        except Exception as e:
-                            warnings.append(f"角色'{name}'的副职业数据解析失败: {str(e)}")
                     
                     # 如果是组织，创建Organization记录
                     if is_organization:
@@ -1683,44 +1776,9 @@ class ImportExportService:
                         )
                         db.add(organization)
                         await db.flush()
-                        
-                        # 导入组织成员数据（如果有）
                         members_data = char_data.get("organization_members_data", [])
                         if members_data and isinstance(members_data, list):
-                            imported_member_count = 0
-                            for m_data in members_data:
-                                try:
-                                    member_char_id = m_data.get("character_id")
-                                    if not member_char_id:
-                                        continue
-                                    # 验证成员角色是否存在于目标项目
-                                    member_char_result = await db.execute(
-                                        select(Character).where(
-                                            Character.id == member_char_id,
-                                            Character.project_id == project_id
-                                        )
-                                    )
-                                    if member_char_result.scalar_one_or_none():
-                                        member = OrganizationMember(
-                                            organization_id=organization.id,
-                                            character_id=member_char_id,
-                                            position=m_data.get("position", "成员"),
-                                            rank=m_data.get("rank", 0),
-                                            loyalty=m_data.get("loyalty", 50),
-                                            contribution=m_data.get("contribution", 0),
-                                            status=m_data.get("status", "active"),
-                                            joined_at=m_data.get("joined_at"),
-                                            source=m_data.get("source", "imported")
-                                        )
-                                        db.add(member)
-                                        imported_member_count += 1
-                                except Exception as me:
-                                    logger.warning(f"导入组织成员失败: {str(me)}")
-                            
-                            if imported_member_count > 0:
-                                organization.member_count = imported_member_count
-                                logger.info(f"导入组织'{name}'的 {imported_member_count} 个成员")
-                        
+                            pending_org_members.append((organization, members_data, name))
                         imported_organizations.append(name)
                     else:
                         imported_characters.append(name)
@@ -1732,6 +1790,61 @@ class ImportExportService:
                     logger.error(error_msg)
                     errors.append(error_msg)
                     continue
+
+            character_name_map = await build_character_name_mapping(db, project_id)
+            career_map, project_career_ids = await build_career_name_mapping(db, project_id)
+
+            pack_career_links = list(data.get("character_careers") or [])
+            covered_names = {
+                (item.get("character_name") or "").strip()
+                for item in pack_career_links
+                if isinstance(item, dict)
+            }
+            for legacy in collect_legacy_career_links(characters_data):
+                if (legacy.get("character_name") or "").strip() not in covered_names:
+                    pack_career_links.append(legacy)
+
+            career_link_stats = await restore_character_careers(
+                db,
+                project_id,
+                pack_career_links,
+                character_name_map=character_name_map,
+                career_map=career_map,
+                project_career_ids=project_career_ids,
+                warnings=warnings,
+            )
+            relationship_stats = await restore_relationships(
+                db,
+                project_id,
+                data.get("relationships") or [],
+                character_name_map=character_name_map,
+                warnings=warnings,
+            )
+
+            imported_organization_members = 0
+            if pending_org_members:
+                name_to_id, project_character_ids, organization_character_ids = (
+                    await load_project_character_index(db, project_id)
+                )
+                for organization, members_data, org_name in pending_org_members:
+                    try:
+                        added = await restore_organization_members(
+                            db,
+                            organization,
+                            members_data,
+                            project_id=project_id,
+                            warnings=warnings,
+                            org_label=org_name,
+                            name_to_id=name_to_id,
+                            project_character_ids=project_character_ids,
+                            organization_character_ids=organization_character_ids,
+                        )
+                        imported_organization_members += added
+                        if added:
+                            logger.info(f"导入组织'{org_name}'的 {added} 个成员")
+                    except Exception as member_error:
+                        warnings.append(f"组织「{org_name}」成员关系恢复失败: {member_error}")
+                        logger.warning(f"导入组织成员失败: {member_error}")
             
             # 提交事务
             await db.commit()
@@ -1745,7 +1858,14 @@ class ImportExportService:
                     "total": len(characters_data),
                     "imported": total,
                     "skipped": len(skipped),
-                    "errors": len(errors)
+                    "errors": len(errors),
+                    "imported_relationships": relationship_stats.imported,
+                    "skipped_relationships": relationship_stats.skipped,
+                    "failed_relationships": relationship_stats.failed,
+                    "imported_character_careers": career_link_stats.imported,
+                    "skipped_character_careers": career_link_stats.skipped,
+                    "failed_character_careers": career_link_stats.failed,
+                    "imported_organization_members": imported_organization_members,
                 },
                 "details": {
                     "imported_characters": imported_characters,
@@ -1769,7 +1889,12 @@ class ImportExportService:
                     "total": len(characters_data) if "data" in data else 0,
                     "imported": len(imported_characters) + len(imported_organizations),
                     "skipped": len(skipped),
-                    "errors": len(errors)
+                    "errors": len(errors),
+                    "imported_relationships": 0,
+                    "skipped_relationships": 0,
+                    "failed_relationships": 0,
+                    "imported_character_careers": 0,
+                    "imported_organization_members": 0,
                 },
                 "details": {
                     "imported_characters": imported_characters,
@@ -1798,8 +1923,8 @@ class ImportExportService:
         version = data.get("version", "")
         if not version:
             errors.append("缺少版本信息")
-        elif version not in ImportExportService.SUPPORTED_VERSIONS:
-            warnings.append(f"版本不匹配: 导入文件版本为 {version}, 当前支持版本为 {', '.join(ImportExportService.SUPPORTED_VERSIONS)}")
+        elif version not in ImportExportService.SUPPORTED_CHARACTER_PACK_VERSIONS:
+            warnings.append(f"版本不匹配: 导入文件版本为 {version}, 当前支持版本为 {', '.join(ImportExportService.SUPPORTED_CHARACTER_PACK_VERSIONS)}")
         
         # 检查导出类型
         export_type = data.get("export_type", "")
@@ -1825,11 +1950,26 @@ class ImportExportService:
             
             statistics = {
                 "characters": character_count,
-                "organizations": org_count
+                "organizations": org_count,
+                "relationships": len(data.get("relationships") or []),
+                "careers": len(data.get("careers") or []),
+                "character_careers": len(data.get("character_careers") or []),
+                "organization_members": sum(
+                    len(c.get("organization_members_data") or [])
+                    for c in characters_data
+                    if isinstance(c, dict)
+                ),
             }
         
         if "data" not in data or errors:
-            statistics = {"characters": 0, "organizations": 0}
+            statistics = {
+                "characters": 0,
+                "organizations": 0,
+                "relationships": 0,
+                "careers": 0,
+                "character_careers": 0,
+                "organization_members": 0,
+            }
         
         return {
             "valid": len(errors) == 0,

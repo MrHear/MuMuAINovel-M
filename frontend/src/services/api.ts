@@ -22,6 +22,8 @@ import type {
   BatchOutlineExpansionResponse,
   Character,
   CharacterUpdate,
+  OrganizationMemberCreate,
+  OrganizationMemberBatchResponse,
   Chapter,
   ChapterCreate,
   ChapterUpdate,
@@ -731,7 +733,14 @@ export const characterApi = {
     return api.post<unknown, {
       valid: boolean;
       version: string;
-      statistics: { characters: number; organizations: number };
+      statistics: {
+        characters: number;
+        organizations: number;
+        relationships?: number;
+        careers?: number;
+        character_careers?: number;
+        organization_members?: number;
+      };
       errors: string[];
       warnings: string[];
     }>('/characters/validate-import', formData, {
@@ -751,6 +760,11 @@ export const characterApi = {
         imported: number;
         skipped: number;
         errors: number;
+        imported_relationships?: number;
+        skipped_relationships?: number;
+        failed_relationships?: number;
+        imported_character_careers?: number;
+        imported_organization_members?: number;
       };
       details: {
         imported_characters: string[];
@@ -763,6 +777,13 @@ export const characterApi = {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
   },
+};
+
+export const organizationApi = {
+  addMembersBatch: (orgId: string, members: OrganizationMemberCreate[]) =>
+    api.post<unknown, OrganizationMemberBatchResponse>(`/organizations/${orgId}/members/batch`, {
+      members,
+    }),
 };
 
 export const chapterApi = {

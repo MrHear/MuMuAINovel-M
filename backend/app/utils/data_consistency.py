@@ -4,6 +4,9 @@ from sqlalchemy import select
 from typing import Optional, Tuple, List
 from app.models.character import Character
 from app.models.relationship import Organization, OrganizationMember, CharacterRelationship
+from app.services.organization_member_service import (
+    sync_organization_member_count as sync_organization_member_count,
+)
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -59,38 +62,7 @@ async def ensure_organization_record(
     return org
 
 
-async def sync_organization_member_count(
-    organization: Organization,
-    db: AsyncSession
-) -> int:
-    """
-    同步组织的成员计数，从实际成员记录计算
-    
-    Args:
-        organization: Organization对象
-        db: 数据库会话
-        
-    Returns:
-        实际成员数量
-    """
-    result = await db.execute(
-        select(OrganizationMember).where(
-            OrganizationMember.organization_id == organization.id,
-            OrganizationMember.status == "active"
-        )
-    )
-    members = result.scalars().all()
-    actual_count = len(members)
-    
-    if organization.member_count != actual_count:
-        logger.warning(
-            f"组织 {organization.id} 成员计数不一致：" 
-            f"记录值={organization.member_count}, 实际值={actual_count}，已修正"
-        )
-        organization.member_count = actual_count
-        await db.flush()
-    
-    return actual_count
+# sync_organization_member_count 统一实现见 organization_member_service
 
 
 async def fix_missing_organization_records(

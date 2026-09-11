@@ -412,6 +412,18 @@ export default function Characters() {
             <ul style={{ marginLeft: 20 }}>
               <li>角色: {validation.statistics.characters} 个</li>
               <li>组织: {validation.statistics.organizations} 个</li>
+              {(validation.statistics.relationships || 0) > 0 && (
+                <li>人物关系: {validation.statistics.relationships} 条</li>
+              )}
+              {(validation.statistics.careers || 0) > 0 && (
+                <li>职业定义: {validation.statistics.careers} 个</li>
+              )}
+              {(validation.statistics.character_careers || 0) > 0 && (
+                <li>职业关联: {validation.statistics.character_careers} 条</li>
+              )}
+              {(validation.statistics.organization_members || 0) > 0 && (
+                <li>组织成员: {validation.statistics.organization_members} 条</li>
+              )}
             </ul>
             {validation.warnings.length > 0 && (
               <>
@@ -440,7 +452,11 @@ export default function Characters() {
                 centered: true,
                 content: (
                   <div>
-                    <p><strong>✅ 成功导入: {result.statistics.imported} 个</strong></p>
+                    <p><strong>✅ 成功导入 {result.details.imported_characters.length} 个角色</strong></p>
+                    <p>组织 {result.details.imported_organizations.length} 个</p>
+                    <p>人物关系 {result.statistics.imported_relationships || 0} 条</p>
+                    <p>职业关联 {result.statistics.imported_character_careers || 0} 条</p>
+                    <p>组织成员关系 {result.statistics.imported_organization_members || 0} 条</p>
                     {result.details.imported_characters.length > 0 && (
                       <>
                         <p style={{ marginTop: 12, marginBottom: 4 }}>角色:</p>

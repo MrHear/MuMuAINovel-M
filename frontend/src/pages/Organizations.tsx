@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams } from 'react-router-dom';
 import { Card, Table, Tag, Button, Space, message, Modal, Form, Select, InputNumber, Input, Descriptions, Drawer, theme } from 'antd';
-import { PlusOutlined, UserOutlined, EditOutlined, DeleteOutlined, UnorderedListOutlined, BankOutlined } from '@ant-design/icons';
+import { PlusOutlined, UserOutlined, UsergroupAddOutlined, EditOutlined, DeleteOutlined, UnorderedListOutlined, BankOutlined } from '@ant-design/icons';
 import { useStore } from '../store';
 import { useCharacterSync } from '../store/hooks';
 import axios from 'axios';
 import { eventBus, EventNames } from '../store/eventBus';
+import { organizationApi } from '../services/api';
 
 interface Organization {
   id: string;
@@ -40,6 +41,16 @@ interface Character {
   is_organization: boolean;
 }
 
+interface BatchMemberRow {
+  character_id: string;
+  character_name: string;
+  position: string;
+  rank: number;
+  loyalty: number;
+  status: string;
+  joined_at?: string;
+}
+
 export default function Organizations() {
   const { projectId } = useParams<{ projectId: string }>();
   const { currentProject } = useStore();
@@ -50,6 +61,15 @@ export default function Organizations() {
   const [characters, setCharacters] = useState<Character[]>([]);
   const [loading, setLoading] = useState(false);
   const [isAddMemberModalOpen, setIsAddMemberModalOpen] = useState(false);
+  const [isBatchAddModalOpen, setIsBatchAddModalOpen] = useState(false);
+  const [batchDefaults, setBatchDefaults] = useState({
+    position: '',
+    rank: 0,
+    loyalty: 50,
+    status: 'active',
+  });
+  const [batchRows, setBatchRows] = useState<BatchMemberRow[]>([]);
+  const [batchSubmitting, setBatchSubmitting] = useState(false);
   const [isEditMemberModalOpen, setIsEditMemberModalOpen] = useState(false);
   const [isEditOrgModalOpen, setIsEditOrgModalOpen] = useState(false);
   const [editingMember, setEditingMember] = useState<OrganizationMember | null>(null);
@@ -146,6 +166,82 @@ export default function Organizations() {
     } catch (error) {
       message.error('添加成员失败');
       console.error(error);
+    }
+  };
+
+  const resetBatchAdd = () => {
+    setBatchRows([]);
+    setBatchDefaults({ position: '', rank: 0, loyalty: 50, status: 'active' });
+  };
+
+  const handleBatchCharacterChange = (characterIds: string[]) => {
+    setBatchRows(prev => {
+      const kept = prev.filter(row => characterIds.includes(row.character_id));
+      const existingIds = new Set(kept.map(row => row.character_id));
+      const added = characterIds
+        .filter(id => !existingIds.has(id))
+        .map(id => {
+          const character = availableCharacters.find(item => item.id === id);
+          return {
+            character_id: id,
+            character_name: character?.name || id,
+            position: batchDefaults.position,
+            rank: batchDefaults.rank,
+            loyalty: batchDefaults.loyalty,
+            status: batchDefaults.status,
+            joined_at: undefined,
+          };
+        });
+      return [...kept, ...added];
+    });
+  };
+
+  const updateBatchRow = (characterId: string, patch: Partial<BatchMemberRow>) => {
+    setBatchRows(prev => prev.map(row => (
+      row.character_id === characterId ? { ...row, ...patch } : row
+    )));
+  };
+
+  const handleBatchAddMembers = async () => {
+    if (!selectedOrg) return;
+    if (batchRows.length === 0) {
+      message.warning('请至少选择一个角色');
+      return;
+    }
+    if (batchRows.some(row => !row.position.trim())) {
+      message.warning('请为每位成员填写职位，或先填写默认职位');
+      return;
+    }
+
+    setBatchSubmitting(true);
+    try {
+      const result = await organizationApi.addMembersBatch(
+        selectedOrg.id,
+        batchRows.map(row => ({
+          character_id: row.character_id,
+          position: row.position.trim(),
+          rank: row.rank,
+          loyalty: row.loyalty,
+          contribution: 0,
+          status: row.status,
+          joined_at: row.joined_at,
+        }))
+      );
+      message.success(
+        `成功 ${result.added.length} 人 / 跳过 ${result.skipped.length} 人 / 失败 ${result.errors.length} 人`
+      );
+      if (result.errors.length > 0) {
+        message.warning(result.errors.map(item => item.reason).filter(Boolean).join('；'));
+      }
+      setIsBatchAddModalOpen(false);
+      resetBatchAdd();
+      loadMembers(selectedOrg.id);
+      loadOrganizations();
+    } catch (error) {
+      message.error('批量添加失败');
+      console.error(error);
+    } finally {
+      setBatchSubmitting(false);
     }
   };
 
@@ -536,15 +632,25 @@ export default function Organizations() {
                 <Card
                   title={`组织成员 (${members.length})`}
                   extra={
-                    <Button
-                      type="primary"
-                      size="small"
-                      icon={<PlusOutlined />}
-                      onClick={() => setIsAddMemberModalOpen(true)}
-                      disabled={availableCharacters.length === 0}
-                    >
-                      添加成员
-                    </Button>
+                    <Space size={8}>
+                      <Button
+                        size="small"
+                        icon={<UsergroupAddOutlined />}
+                        onClick={() => setIsBatchAddModalOpen(true)}
+                        disabled={availableCharacters.length === 0}
+                      >
+                        批量添加
+                      </Button>
+                      <Button
+                        type="primary"
+                        size="small"
+                        icon={<PlusOutlined />}
+                        onClick={() => setIsAddMemberModalOpen(true)}
+                        disabled={availableCharacters.length === 0}
+                      >
+                        添加成员
+                      </Button>
+                    </Space>
                   }
                 >
                   <Table
@@ -669,6 +775,119 @@ export default function Organizations() {
             </Space>
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title="批量添加成员"
+        open={isBatchAddModalOpen}
+        onCancel={() => {
+          setIsBatchAddModalOpen(false);
+          resetBatchAdd();
+        }}
+        onOk={handleBatchAddMembers}
+        okText="批量添加"
+        confirmLoading={batchSubmitting}
+        centered={!isMobile}
+        width={isMobile ? '100%' : 640}
+        style={isMobile ? { top: 0, paddingBottom: 0, maxWidth: '100vw' } : undefined}
+        styles={isMobile ? { body: { maxHeight: 'calc(100vh - 110px)', overflowY: 'auto' } } : undefined}
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size="middle">
+          <div style={{ color: token.colorTextSecondary, fontSize: 13 }}>
+            先填写默认职位和忠诚度，再一次勾选多个角色；已在组织中的角色不会出现在列表里。
+          </div>
+          <Space wrap style={{ width: '100%' }}>
+            <Input
+              placeholder="默认职位"
+              value={batchDefaults.position}
+              onChange={event => setBatchDefaults(prev => ({ ...prev, position: event.target.value }))}
+              style={{ width: isMobile ? '100%' : 180 }}
+            />
+            <InputNumber
+              min={0}
+              max={10}
+              value={batchDefaults.rank}
+              onChange={value => setBatchDefaults(prev => ({ ...prev, rank: value ?? 0 }))}
+              addonBefore="等级"
+            />
+            <InputNumber
+              min={0}
+              max={100}
+              value={batchDefaults.loyalty}
+              onChange={value => setBatchDefaults(prev => ({ ...prev, loyalty: value ?? 50 }))}
+              addonBefore="忠诚"
+              addonAfter="%"
+            />
+            <Select
+              value={batchDefaults.status}
+              onChange={value => setBatchDefaults(prev => ({ ...prev, status: value }))}
+              style={{ width: 110 }}
+              options={[
+                { value: 'active', label: '在职' },
+                { value: 'retired', label: '退休' },
+                { value: 'expelled', label: '除名' },
+              ]}
+            />
+          </Space>
+          <Select
+            mode="multiple"
+            placeholder="选择要加入的角色"
+            value={batchRows.map(row => row.character_id)}
+            onChange={handleBatchCharacterChange}
+            showSearch
+            optionFilterProp="label"
+            options={availableCharacters.map(character => ({
+              label: character.name,
+              value: character.id,
+            }))}
+            style={{ width: '100%' }}
+          />
+          {batchRows.map(row => (
+            <Card key={row.character_id} size="small">
+              <Space direction="vertical" style={{ width: '100%' }} size={8}>
+                <strong>{row.character_name}</strong>
+                <Space wrap style={{ width: '100%' }}>
+                  <Input
+                    placeholder="职位"
+                    value={row.position}
+                    onChange={event => updateBatchRow(row.character_id, { position: event.target.value })}
+                    style={{ width: isMobile ? '100%' : 160 }}
+                  />
+                  <InputNumber
+                    min={0}
+                    max={10}
+                    value={row.rank}
+                    onChange={value => updateBatchRow(row.character_id, { rank: value ?? 0 })}
+                    addonBefore="等级"
+                  />
+                  <InputNumber
+                    min={0}
+                    max={100}
+                    value={row.loyalty}
+                    onChange={value => updateBatchRow(row.character_id, { loyalty: value ?? 50 })}
+                    addonBefore="忠诚"
+                  />
+                  <Select
+                    value={row.status}
+                    onChange={value => updateBatchRow(row.character_id, { status: value })}
+                    style={{ width: 110 }}
+                    options={[
+                      { value: 'active', label: '在职' },
+                      { value: 'retired', label: '退休' },
+                      { value: 'expelled', label: '除名' },
+                    ]}
+                  />
+                  <Input
+                    placeholder="加入时间"
+                    value={row.joined_at}
+                    onChange={event => updateBatchRow(row.character_id, { joined_at: event.target.value })}
+                    style={{ width: isMobile ? '100%' : 140 }}
+                  />
+                </Space>
+              </Space>
+            </Card>
+          ))}
+        </Space>
       </Modal>
 
       {/* 编辑成员模态框 */}
